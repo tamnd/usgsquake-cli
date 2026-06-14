@@ -1,62 +1,179 @@
-// Package usgsquake is the library behind the usgsquake command line:
-// the HTTP client, request shaping, and the typed data models for usgsquake.
+// Package usgsquake is the library behind the quake command line:
+// the HTTP client, request shaping, and typed data models for the USGS
+// FDSNWS Earthquake Event Web Service (earthquake.usgs.gov/fdsnws/event/1).
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The USGS API is free and requires no API key. It returns seismic events
+// worldwide in GeoJSON format with magnitude, location, depth, and metadata.
 package usgsquake
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"net/url"
+	"strconv"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to usgsquake. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "usgsquake/dev (+https://github.com/tamnd/usgsquake-cli)"
+// Host is the API host this client talks to.
+const Host = "earthquake.usgs.gov"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at usgsquake.com; change it once you
-// know the real endpoints you want to read.
-const Host = "usgsquake.com"
-
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
-
-// Client talks to usgsquake over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds all tunable parameters for the Client.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
+// DefaultConfig returns a Config with sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://earthquake.usgs.gov/fdsnws/event/1",
+		UserAgent: "usgsquake-cli/0.1.0 (github.com/tamnd/usgsquake-cli)",
 		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Timeout:   30 * time.Second,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to the USGS earthquake API over HTTP.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	mu   sync.Mutex
+	last time.Time
+}
+
+// NewClient returns a Client configured with cfg.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// ListParams holds optional filters for a list query.
+type ListParams struct {
+	MinMag float64
+	MaxMag float64
+	Start  string
+	End    string
+	Limit  int
+}
+
+// List queries /query for earthquakes matching the given params.
+func (c *Client) List(ctx context.Context, p ListParams) ([]Earthquake, error) {
+	q := url.Values{}
+	q.Set("format", "geojson")
+	if p.MinMag > 0 {
+		q.Set("minmagnitude", strconv.FormatFloat(p.MinMag, 'f', -1, 64))
+	}
+	if p.MaxMag > 0 {
+		q.Set("maxmagnitude", strconv.FormatFloat(p.MaxMag, 'f', -1, 64))
+	}
+	if p.Start != "" {
+		q.Set("starttime", p.Start)
+	}
+	if p.End != "" {
+		q.Set("endtime", p.End)
+	}
+	if p.Limit > 0 {
+		q.Set("limit", strconv.Itoa(p.Limit))
+	}
+	body, err := c.get(ctx, c.cfg.BaseURL+"/query?"+q.Encode())
+	if err != nil {
+		return nil, err
+	}
+	return parseFeatureCollection(body)
+}
+
+// Nearby queries /query for earthquakes near a point.
+func (c *Client) Nearby(ctx context.Context, lat, lon, radiusKm, minMag float64, limit int) ([]Earthquake, error) {
+	q := url.Values{}
+	q.Set("format", "geojson")
+	q.Set("latitude", strconv.FormatFloat(lat, 'f', -1, 64))
+	q.Set("longitude", strconv.FormatFloat(lon, 'f', -1, 64))
+	q.Set("maxradiuskm", strconv.FormatFloat(radiusKm, 'f', -1, 64))
+	if minMag > 0 {
+		q.Set("minmagnitude", strconv.FormatFloat(minMag, 'f', -1, 64))
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	body, err := c.get(ctx, c.cfg.BaseURL+"/query?"+q.Encode())
+	if err != nil {
+		return nil, err
+	}
+	return parseFeatureCollection(body)
+}
+
+// CountParams holds filters for a count query.
+type CountParams struct {
+	MinMag float64
+	Start  string
+	End    string
+}
+
+// Count queries /count for the number of earthquakes matching params.
+func (c *Client) Count(ctx context.Context, p CountParams) (*Count, error) {
+	q := url.Values{}
+	q.Set("format", "json")
+	if p.MinMag > 0 {
+		q.Set("minmagnitude", strconv.FormatFloat(p.MinMag, 'f', -1, 64))
+	}
+	if p.Start != "" {
+		q.Set("starttime", p.Start)
+	}
+	if p.End != "" {
+		q.Set("endtime", p.End)
+	}
+	body, err := c.get(ctx, c.cfg.BaseURL+"/count?"+q.Encode())
+	if err != nil {
+		return nil, err
+	}
+	var ct Count
+	if err := json.Unmarshal(body, &ct); err != nil {
+		return nil, fmt.Errorf("decode count: %w", err)
+	}
+	return &ct, nil
+}
+
+// Get fetches a single earthquake event by USGS event ID.
+func (c *Client) Get(ctx context.Context, eventID string) (*Earthquake, error) {
+	q := url.Values{}
+	q.Set("format", "geojson")
+	q.Set("eventid", eventID)
+	body, err := c.get(ctx, c.cfg.BaseURL+"/query?"+q.Encode())
+	if err != nil {
+		return nil, err
+	}
+	// Single event response is a Feature, not FeatureCollection
+	var feature rawFeature
+	if err := json.Unmarshal(body, &feature); err != nil {
+		return nil, fmt.Errorf("decode feature: %w", err)
+	}
+	if feature.ID != "" {
+		return convertFeature(feature), nil
+	}
+	// Might also come as a FeatureCollection with one item
+	eqs, err := parseFeatureCollection(body)
+	if err != nil {
+		return nil, err
+	}
+	if len(eqs) == 0 {
+		return nil, fmt.Errorf("event %q not found", eventID)
+	}
+	return &eqs[0], nil
+}
+
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +181,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,128 +190,113 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
-
-	resp, err := c.HTTP.Do(req)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
-
 	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, err
-	}
-	return b, false, nil
+	return b, err != nil, err
 }
 
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
 }
 
 func backoff(attempt int) time.Duration {
-	d := time.Duration(attempt) * 500 * time.Millisecond
-	if d > 5*time.Second {
-		d = 5 * time.Second
-	}
-	return d
+	return min(time.Duration(attempt)*500*time.Millisecond, 5*time.Second)
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on usgsquake.com. It is a stand-in for the typed records you
-// will model from the real usgsquake endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `usgsquake cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// --- raw API response types ---
+
+type rawFeatureCollection struct {
+	Type     string       `json:"type"`
+	Features []rawFeature `json:"features"`
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
+type rawFeature struct {
+	Type       string         `json:"type"`
+	ID         string         `json:"id"`
+	Properties rawProperties  `json:"properties"`
+	Geometry   rawGeometry    `json:"geometry"`
 }
 
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
+type rawProperties struct {
+	Mag    float64 `json:"mag"`
+	Place  string  `json:"place"`
+	Time   int64   `json:"time"`
+	Updated int64  `json:"updated"`
+	URL    string  `json:"url"`
+	Title  string  `json:"title"`
+	Status string  `json:"status"`
+	Tsunami int    `json:"tsunami"`
+	Sig    int     `json:"sig"`
+	Type   string  `json:"type"`
+}
+
+type rawGeometry struct {
+	Type        string    `json:"type"`
+	Coordinates []float64 `json:"coordinates"`
+}
+
+func parseFeatureCollection(body []byte) ([]Earthquake, error) {
+	var fc rawFeatureCollection
+	if err := json.Unmarshal(body, &fc); err != nil {
+		return nil, fmt.Errorf("decode feature collection: %w", err)
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+	out := make([]Earthquake, 0, len(fc.Features))
+	for _, f := range fc.Features {
+		out = append(out, *convertFeature(f))
 	}
 	return out, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
+func convertFeature(f rawFeature) *Earthquake {
+	eq := &Earthquake{
+		ID:           f.ID,
+		Place:        f.Properties.Place,
+		Title:        f.Properties.Title,
+		Status:       f.Properties.Status,
+		Type:         f.Properties.Type,
+		Magnitude:    f.Properties.Mag,
+		Time:         f.Properties.Time,
+		Updated:      f.Properties.Updated,
+		Tsunami:      f.Properties.Tsunami,
+		Significance: f.Properties.Sig,
+		URL:          f.Properties.URL,
 	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+	// coordinates = [lon, lat, depth]
+	if len(f.Geometry.Coordinates) >= 3 {
+		eq.Lon = f.Geometry.Coordinates[0]
+		eq.Lat = f.Geometry.Coordinates[1]
+		eq.Depth = f.Geometry.Coordinates[2]
+	} else if len(f.Geometry.Coordinates) == 2 {
+		eq.Lon = f.Geometry.Coordinates[0]
+		eq.Lat = f.Geometry.Coordinates[1]
 	}
-	return s
+	return eq
 }

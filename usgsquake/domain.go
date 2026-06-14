@@ -1,77 +1,84 @@
+// Package usgsquake exposes the USGS Earthquake catalog as a kit Domain driver.
+//
+// A multi-domain host (ant) enables it with a single blank import:
+//
+//	import _ "github.com/tamnd/usgsquake-cli/usgsquake"
+//
+// The same Domain also builds the standalone quake binary (see cli.NewApp).
 package usgsquake
 
 import (
 	"context"
-	"net/url"
-	"strings"
+	"fmt"
+	"time"
 
 	"github.com/tamnd/any-cli/kit"
-	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes usgsquake as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/usgsquake-cli/usgsquake"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// usgsquake:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone usgsquake binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the usgsquake driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the usgsquake driver.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, the hostnames a pasted link is matched against,
+// and the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "usgsquake",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
-			Binary: "usgsquake",
+			Binary: "quake",
 			Short:  "USGS earthquake catalog",
-			Long: `USGS earthquake catalog
+			Long: `quake queries the USGS FDSNWS earthquake catalog for seismic events worldwide.
 
-usgsquake reads public usgsquake data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+No API key required. Data from the USGS Comprehensive Earthquake Catalog (ComCat).`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/usgsquake-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `usgsquake page` and
-	// `ant get usgsquake://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "list",
+		Group:   "read",
+		List:    true,
+		Summary: "List earthquakes by magnitude and date range",
+	}, listOp)
 
-	// List op: members of a page, the home of `usgsquake links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// usgsquake://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "nearby",
+		Group:   "read",
+		List:    true,
+		Summary: "Find earthquakes near a geographic point",
+		Args: []kit.Arg{
+			{Name: "lat", Help: "latitude in decimal degrees"},
+			{Name: "lon", Help: "longitude in decimal degrees"},
+		},
+	}, nearbyOp)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:    "count",
+		Group:   "read",
+		Single:  true,
+		Summary: "Count earthquakes matching criteria",
+	}, countOp)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:    "get",
+		Group:   "read",
+		Single:  true,
+		Summary: "Fetch a single earthquake event by USGS ID",
+		Args:    []kit.Arg{{Name: "event_id", Help: "USGS event ID (e.g. us7000m6al)"}},
+	}, getOp)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the USGS client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,92 +89,118 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// --- input structs ---
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type listInput struct {
+	MinMag float64 `kit:"flag" help:"minimum magnitude" default:"4.0"`
+	MaxMag float64 `kit:"flag" help:"maximum magnitude"`
+	Start  string  `kit:"flag" help:"start date (YYYY-MM-DD)"`
+	End    string  `kit:"flag" help:"end date (YYYY-MM-DD)"`
+	Limit  int     `kit:"flag,inherit" help:"max results" default:"20"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type nearbyInput struct {
+	Lat    string  `kit:"arg" help:"latitude in decimal degrees"`
+	Lon    string  `kit:"arg" help:"longitude in decimal degrees"`
+	Radius float64 `kit:"flag" help:"search radius in km" default:"200"`
+	MinMag float64 `kit:"flag" help:"minimum magnitude" default:"3.0"`
+	Limit  int     `kit:"flag,inherit" help:"max results" default:"10"`
 	Client *Client `kit:"inject"`
+}
+
+type countInput struct {
+	MinMag float64 `kit:"flag" help:"minimum magnitude" default:"4.0"`
+	Start  string  `kit:"flag" help:"start date (YYYY-MM-DD)"`
+	End    string  `kit:"flag" help:"end date (YYYY-MM-DD)"`
+	Client *Client `kit:"inject"`
+}
+
+type getInput struct {
+	EventID string  `kit:"arg" help:"USGS event ID (e.g. us7000m6al)"`
+	Client  *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
-	if err != nil {
-		return mapErr(err)
+func listOp(ctx context.Context, in listInput, emit func(Earthquake) error) error {
+	start := in.Start
+	if start == "" {
+		start = time.Now().AddDate(0, 0, -30).Format("2006-01-02")
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+	eqs, err := in.Client.List(ctx, ListParams{
+		MinMag: in.MinMag,
+		MaxMag: in.MaxMag,
+		Start:  start,
+		End:    in.End,
+		Limit:  in.Limit,
+	})
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, eq := range eqs {
+		if err := emit(eq); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full usgsquake.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized usgsquake reference: %q", input)
+func nearbyOp(ctx context.Context, in nearbyInput, emit func(Earthquake) error) error {
+	var lat, lon float64
+	if _, err := fmt.Sscanf(in.Lat, "%f", &lat); err != nil {
+		return fmt.Errorf("invalid lat %q: %w", in.Lat, err)
 	}
-	return "page", id, nil
+	if _, err := fmt.Sscanf(in.Lon, "%f", &lon); err != nil {
+		return fmt.Errorf("invalid lon %q: %w", in.Lon, err)
+	}
+	eqs, err := in.Client.Nearby(ctx, lat, lon, in.Radius, in.MinMag, in.Limit)
+	if err != nil {
+		return err
+	}
+	for _, eq := range eqs {
+		if err := emit(eq); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
-func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("usgsquake has no resource type %q", uriType)
+func countOp(ctx context.Context, in countInput, emit func(*Count) error) error {
+	start := in.Start
+	if start == "" {
+		start = time.Now().AddDate(0, 0, -30).Format("2006-01-02")
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
+	ct, err := in.Client.Count(ctx, CountParams{
+		MinMag: in.MinMag,
+		Start:  start,
+		End:    in.End,
+	})
+	if err != nil {
+		return err
+	}
+	return emit(ct)
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
+func getOp(ctx context.Context, in getInput, emit func(*Earthquake) error) error {
+	eq, err := in.Client.Get(ctx, in.EventID)
+	if err != nil {
+		return err
 	}
-	return strings.Trim(input, "/")
+	return emit(eq)
 }
 
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
+// Classify turns any input into the canonical (type, id).
+func (Domain) Classify(input string) (string, string, error) {
+	return "event", input, nil
+}
+
+// Locate returns the live USGS URL for a (type, id).
+func (Domain) Locate(t, id string) (string, error) {
+	return "https://earthquake.usgs.gov/earthquakes/eventpage/" + id, nil
 }
