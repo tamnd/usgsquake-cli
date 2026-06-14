@@ -1,0 +1,10 @@
+title       = "usgsquake"
+baseURL     = "https://usgsquake-cli.tamnd.com/"
+description = "USGS earthquake catalog"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/usgsquake-cli"
